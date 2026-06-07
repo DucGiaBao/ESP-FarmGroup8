@@ -732,6 +732,23 @@ function App() {
     [readings],
   )
 
+  const soilWarning = useMemo(() => {
+    if (!latest) {
+      return null
+    }
+
+    const soilPercent = latest.soilPercent
+    if (typeof soilPercent !== 'number') {
+      return null
+    }
+
+    if (soilPercent >= 35) {
+      return null
+    }
+
+    return `Cảnh báo: Độ ẩm đất thấp (${soilPercent.toFixed(0)}%).`
+  }, [latest])
+
   const handleRefresh = useCallback(() => {
     void loadSensorData()
     void syncControlStates()
@@ -826,6 +843,8 @@ function App() {
             <p>{readings.length} points loaded</p>
           </div>
         )}
+
+        {soilWarning && <p className="status warning">{soilWarning}</p>}
 
         {loading && <p className="status">Loading sensor data...</p>}
 

@@ -257,6 +257,10 @@
   color: #d32f2f;
 }
 
+.status.warning {
+  color: #d97706;
+}
+
 .auth-panel {
   width: min(460px, 100%);
   margin: 0 auto;
