@@ -35,6 +35,32 @@ const METRICS: MetricConfig[] = [
   { title: 'Soil Percent', valueKey: 'soilPercent', unit: '%', stroke: '#10b981' },
 ]
 
+function normalizeMqttUrl(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return trimmed
+  }
+
+  try {
+    const url = new URL(trimmed)
+    if (url.pathname === '/' || url.pathname === '') {
+      url.pathname = '/mqtt'
+    }
+
+    if (url.pathname.endsWith('/')) {
+      url.pathname = url.pathname.slice(0, -1)
+    }
+
+    if (url.pathname.endsWith('/mqtt')) {
+      url.pathname = '/mqtt'
+    }
+
+    return url.toString()
+  } catch {
+    return trimmed.replace(/\/+$/, '')
+  }
+}
+
 function ControlCard({
   title,
   enabled,
@@ -199,8 +225,14 @@ function MetricChart({
             <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
             <XAxis
               dataKey="createdAt"
-              reversed
-              tickFormatter={(value: string) => new Date(value).toLocaleTimeString()}
+              tickFormatter={(value: string) =>
+                new Date(value).toLocaleString([], {
+                  month: '2-digit',
+                  day: '2-digit',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })
+              }
               minTickGap={24}
             />
             <YAxis width={48} domain={yDomain} />
@@ -238,7 +270,12 @@ function MetricChart({
                   setRange({ start: next.startIndex, end: next.endIndex })
                 }
               }}
-              tickFormatter={(value: string) => new Date(value).toLocaleTimeString()}
+              tickFormatter={(value: string) =>
+                new Date(value).toLocaleString([], {
+                  month: '2-digit',
+                  day: '2-digit',
+                })
+              }
             />
           </LineChart>
         </ResponsiveContainer>
@@ -394,9 +431,12 @@ function App() {
 
   const adafruitUsername = import.meta.env.VITE_ADAFRUIT_USERNAME as string | undefined
   const adafruitKey = import.meta.env.VITE_ADAFRUIT_KEY as string | undefined
-  const mqttUrl =
-    (import.meta.env.VITE_ADAFRUIT_MQTT_URL as string | undefined) ??
-    'wss://io.adafruit.com:443/mqtt/'
+  const mqttUrl = useMemo(() => {
+    const configured =
+      (import.meta.env.VITE_ADAFRUIT_MQTT_URL as string | undefined) ??
+      'wss://io.adafruit.com:443/mqtt'
+    return normalizeMqttUrl(configured)
+  }, [])
 
   const temperatureFeed =
     (import.meta.env.VITE_ADAFRUIT_TEMP_FEED as string | undefined) ??
@@ -570,8 +610,9 @@ function App() {
     const client = mqtt.connect(mqttUrl, {
       username: adafruitUsername,
       password: adafruitKey,
-      reconnectPeriod: 3000,
+      reconnectPeriod: 5000,
       connectTimeout: 10000,
+      keepalive: 30,
       clean: true,
     })
 
@@ -631,27 +672,59 @@ function App() {
   ])
 
   const publishControl = useCallback(
-    (key: ControlKey) => {
-      const client = mqttClientRef.current
-      if (!client || mqttStatus !== 'connected') {
-        return
-      }
-
+    async (key: ControlKey) => {
       const nextValue = controls[key] ? '0' : '1'
       const nextEnabled = nextValue === '1'
 
       setControlPending((prev) => ({ ...prev, [key]: true }))
       setControls((prev) => ({ ...prev, [key]: nextEnabled }))
 
-      client.publish(feedByKey[key], nextValue, { qos: 1 }, (publishError) => {
-        if (publishError) {
-          setMqttError(publishError.message)
-          setControlPending((prev) => ({ ...prev, [key]: false }))
-          setControls((prev) => ({ ...prev, [key]: !nextEnabled }))
+      try {
+        const client = mqttClientRef.current
+        if (client && mqttStatus === 'connected') {
+          await new Promise<void>((resolve, reject) => {
+            client.publish(feedByKey[key], nextValue, { qos: 1 }, (publishError) => {
+              if (publishError) {
+                reject(publishError)
+                return
+              }
+              resolve()
+            })
+          })
+        } else {
+          if (!adafruitUsername || !adafruitKey) {
+            throw new Error('Missing Adafruit credentials')
+          }
+
+          const feedKey = getFeedKeyFromTopic(feedByKey[key])
+          const res = await fetch(
+            `https://io.adafruit.com/api/v2/${adafruitUsername}/feeds/${feedKey}/data`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-AIO-Key': adafruitKey,
+              },
+              body: JSON.stringify({ value: nextValue }),
+            },
+          )
+
+          if (!res.ok) {
+            throw new Error(`Adafruit publish failed (${res.status})`)
+          }
         }
-      })
+
+        setMqttError(null)
+      } catch (publishError) {
+        const message =
+          publishError instanceof Error ? publishError.message : 'Unable to publish switch value'
+        setMqttError(message)
+        setControls((prev) => ({ ...prev, [key]: !nextEnabled }))
+      } finally {
+        setControlPending((prev) => ({ ...prev, [key]: false }))
+      }
     },
-    [controls, feedByKey, mqttStatus],
+    [adafruitKey, adafruitUsername, controls, feedByKey, getFeedKeyFromTopic, mqttStatus],
   )
 
   const latest = useMemo(
@@ -735,14 +808,14 @@ function App() {
             <ControlCard
               title="Temperature Switch"
               enabled={controls.temperature}
-              pending={controlPending.temperature || mqttStatus !== 'connected'}
-              onToggle={() => publishControl('temperature')}
+              pending={controlPending.temperature}
+              onToggle={() => void publishControl('temperature')}
             />
             <ControlCard
               title="Soil Switch"
               enabled={controls.soil}
-              pending={controlPending.soil || mqttStatus !== 'connected'}
-              onToggle={() => publishControl('soil')}
+              pending={controlPending.soil}
+              onToggle={() => void publishControl('soil')}
             />
           </div>
         </section>

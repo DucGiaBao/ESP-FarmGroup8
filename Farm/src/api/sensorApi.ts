@@ -15,14 +15,25 @@ interface SensorRow {
 
 const SENSOR_TABLE = 'sensor_events'
 
+let cachedTimeColumn: 'created_at' | 'timestamp' | null = null
+
+function normalizeTimestamp(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return trimmed
+  }
+
+  return trimmed.replace(/(\.\d{3})\d+(?=(Z|[+-]\d\d:\d\d)$)/, '$1')
+}
+
 function mapSensorRow(row: SensorRow): SensorReading {
   const temperature = row.temperature_c ?? row.temperature ?? row.temp
   const humidity = row.humidity ?? row.hum
   const soilRaw = row.soil_raw ?? null
   const soilPercent = row.soil_percent ?? null
-  const createdAt = row.created_at ?? row.timestamp
+  const createdAtRaw = row.created_at ?? row.timestamp
 
-  if (!createdAt) {
+  if (!createdAtRaw) {
     throw new Error('invalid-row')
   }
 
@@ -31,7 +42,7 @@ function mapSensorRow(row: SensorRow): SensorReading {
     humidity,
     soilRaw,
     soilPercent,
-    createdAt,
+    createdAt: normalizeTimestamp(createdAtRaw),
   }
 }
 
@@ -43,13 +54,42 @@ function toSensorReadingOrNull(row: SensorRow): SensorReading | null {
   }
 }
 
+async function getTimeColumn(): Promise<'created_at' | 'timestamp'> {
+  if (cachedTimeColumn) {
+    return cachedTimeColumn
+  }
+
+  const supabase = getSupabaseClient()
+  const { data, error } = await supabase.from(SENSOR_TABLE).select('*').limit(1)
+
+  if (error) {
+    cachedTimeColumn = 'created_at'
+    return cachedTimeColumn
+  }
+
+  const row = (data?.[0] as Record<string, unknown> | undefined) ?? undefined
+  if (row && 'created_at' in row) {
+    cachedTimeColumn = 'created_at'
+    return cachedTimeColumn
+  }
+
+  if (row && 'timestamp' in row) {
+    cachedTimeColumn = 'timestamp'
+    return cachedTimeColumn
+  }
+
+  cachedTimeColumn = 'created_at'
+  return cachedTimeColumn
+}
+
 export async function fetchLatestSensorReading(): Promise<SensorReading | null> {
   const supabase = getSupabaseClient()
+  const timeColumn = await getTimeColumn()
 
   const { data, error } = await supabase
     .from(SENSOR_TABLE)
-    .select('temperature_c,humidity,soil_raw,soil_percent,created_at')
-    .order('created_at', { ascending: false })
+    .select('*')
+    .order(timeColumn, { ascending: false })
     .limit(1)
 
   if (error) {
@@ -65,11 +105,12 @@ export async function fetchLatestSensorReading(): Promise<SensorReading | null> 
 
 export async function fetchSensorHistory(limit = 40): Promise<SensorReading[]> {
   const supabase = getSupabaseClient()
+  const timeColumn = await getTimeColumn()
 
   const { data, error } = await supabase
     .from(SENSOR_TABLE)
-    .select('temperature_c,humidity,soil_raw,soil_percent,created_at')
-    .order('created_at', { ascending: false })
+    .select('*')
+    .order(timeColumn, { ascending: false })
     .limit(limit)
 
   if (error) {
@@ -83,5 +124,5 @@ export async function fetchSensorHistory(limit = 40): Promise<SensorReading[]> {
   return (data as SensorRow[])
     .map(toSensorReadingOrNull)
     .filter((row): row is SensorReading => row !== null)
-    .reverse()
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
 }
