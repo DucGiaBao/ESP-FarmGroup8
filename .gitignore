@@ -7,3 +7,5 @@
 include/adafruit_secrets.h
 .DS_Store
 .vscode/settings.json
+.platformio-core/
+git
