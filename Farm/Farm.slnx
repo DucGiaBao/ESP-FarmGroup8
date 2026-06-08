@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="farm.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+</Solution>
