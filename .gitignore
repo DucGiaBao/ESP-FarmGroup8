@@ -3,7 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-
 include/adafruit_secrets.h
 .DS_Store
 .vscode/settings.json
+<<<<<<< HEAD
+=======
+.platformio-core/
+git
+>>>>>>> origin/main
