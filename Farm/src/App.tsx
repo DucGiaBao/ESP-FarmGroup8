@@ -27,6 +27,7 @@ interface MetricConfig {
 
 type ControlKey = 'temperature' | 'soil'
 type MqttStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
+type AiStatus = 'idle' | 'loading' | 'ready' | 'error'
 
 const METRICS: MetricConfig[] = [
   { title: 'Temperature', valueKey: 'temperature', unit: '°C', stroke: '#ef4444' },
@@ -34,6 +35,16 @@ const METRICS: MetricConfig[] = [
   { title: 'Soil Raw', valueKey: 'soilRaw', unit: '', stroke: '#8b5cf6' },
   { title: 'Soil Percent', valueKey: 'soilPercent', unit: '%', stroke: '#10b981' },
 ]
+
+function joinUrl(base: string, path: string): string {
+  if (!base) {
+    return path
+  }
+
+  const normalizedBase = base.replace(/\/+$/, '')
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  return `${normalizedBase}${normalizedPath}`
+}
 
 function normalizeMqttUrl(value: string): string {
   const trimmed = value.trim()
@@ -438,6 +449,8 @@ function App() {
     return normalizeMqttUrl(configured)
   }, [])
 
+  const aiUrl = (import.meta.env.VITE_AI_URL as string | undefined) ?? 'http://localhost:8000'
+
   const temperatureFeed =
     (import.meta.env.VITE_ADAFRUIT_TEMP_FEED as string | undefined) ??
     `${adafruitUsername}/feeds/control-dht-enable`
@@ -454,6 +467,14 @@ function App() {
     hasMqttConfig ? 'connecting' : 'error',
   )
   const [mqttError, setMqttError] = useState<string | null>(null)
+  const [aiStatus, setAiStatus] = useState<AiStatus>('idle')
+  const [aiError, setAiError] = useState<string | null>(null)
+  const [aiForecast, setAiForecast] = useState<{
+    timestamps: string[]
+    soilPercentPred: number[]
+    seqLen: number
+    horizon: number
+  } | null>(null)
   const [controls, setControls] = useState<Record<ControlKey, boolean>>({
     temperature: false,
     soil: false,
@@ -727,10 +748,103 @@ function App() {
     [adafruitKey, adafruitUsername, controls, feedByKey, getFeedKeyFromTopic, mqttStatus],
   )
 
+  const runAiForecast = useCallback(async () => {
+    const seqLen = 60
+    const horizon = 30
+
+    const usableSamples = readings
+      .filter(
+        (reading) =>
+          typeof reading.temperature === 'number' &&
+          typeof reading.humidity === 'number' &&
+          typeof reading.soilPercent === 'number',
+      )
+      .slice(-seqLen)
+      .map((reading) => ({
+        timestamp: reading.createdAt,
+        temperature_c: reading.temperature as number,
+        humidity: reading.humidity as number,
+        soil_percent: reading.soilPercent as number,
+      }))
+
+    if (usableSamples.length < 2) {
+      setAiStatus('error')
+      setAiError('Khong du du lieu (can it nhat 2 diem co day du nhiet do, do am, do am dat).')
+      return
+    }
+
+    setAiStatus('loading')
+    setAiError(null)
+
+    try {
+      const url = new URL(joinUrl(aiUrl, '/predict'))
+      url.searchParams.set('seq_len', String(seqLen))
+      url.searchParams.set('horizon', String(horizon))
+
+      const response = await fetch(url.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(usableSamples),
+      })
+
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(text || `AI request failed (${response.status})`)
+      }
+
+      const payload = (await response.json()) as {
+        timestamps?: unknown
+        soil_percent_pred?: unknown
+      }
+
+      const timestamps = Array.isArray(payload.timestamps)
+        ? (payload.timestamps.filter((value) => typeof value === 'string') as string[])
+        : []
+      const soilPercentPred = Array.isArray(payload.soil_percent_pred)
+        ? (payload.soil_percent_pred
+            .map((value) => (typeof value === 'number' ? value : Number(value)))
+            .filter((value) => Number.isFinite(value)) as number[])
+        : []
+
+      if (timestamps.length === 0 || soilPercentPred.length === 0) {
+        throw new Error('AI response invalid')
+      }
+
+      setAiForecast({ timestamps, soilPercentPred, seqLen, horizon })
+      setAiStatus('ready')
+    } catch (error) {
+      setAiStatus('error')
+      setAiForecast(null)
+      setAiError(error instanceof Error ? error.message : 'AI request failed')
+    }
+  }, [aiUrl, readings])
+
   const latest = useMemo(
     () => (readings.length > 0 ? readings[readings.length - 1] : null),
     [readings],
   )
+
+  const forecastChartData = useMemo(() => {
+    if (!aiForecast) {
+      return null
+    }
+
+    const base = readings
+      .slice(-aiForecast.seqLen)
+      .map((reading) => ({
+        createdAt: reading.createdAt,
+        soilPercent: reading.soilPercent,
+        soilPercentPred: null as number | null,
+      }))
+
+    const preds = aiForecast.timestamps.map((timestamp, index) => ({
+      createdAt: timestamp,
+      soilPercent: null as number | null,
+      soilPercentPred: aiForecast.soilPercentPred[index] ?? null,
+    }))
+
+    return [...base, ...preds]
+  }, [aiForecast, readings])
 
   const soilWarning = useMemo(() => {
     if (!latest) {
@@ -846,6 +960,21 @@ function App() {
 
         {soilWarning && <p className="status warning">{soilWarning}</p>}
 
+        <div className="controls-panel">
+          <div className="controls-title-row">
+            <h2>AI Forecast</h2>
+            <span className={`mqtt-status ${aiStatus === 'ready' ? 'connected' : aiStatus === 'loading' ? 'connecting' : aiStatus === 'error' ? 'error' : 'disconnected'}`}>
+              AI: {aiStatus}
+            </span>
+          </div>
+
+          {aiError && <p className="status error">AI error: {aiError}</p>}
+
+          <button type="button" className="refresh-button" onClick={() => void runAiForecast()} disabled={aiStatus === 'loading'}>
+            {aiStatus === 'loading' ? 'Running...' : 'Run forecast'}
+          </button>
+        </div>
+
         {loading && <p className="status">Loading sensor data...</p>}
 
         {!loading && error && (
@@ -853,11 +982,75 @@ function App() {
         )}
 
         {!error && readings.length > 0 && (
-          <div className="charts-grid">
-            {METRICS.map((metric) => (
-              <MetricChart key={metric.valueKey} data={readings} metric={metric} />
-            ))}
-          </div>
+          <>
+            <div className="charts-grid">
+              {METRICS.map((metric) => (
+                <MetricChart key={metric.valueKey} data={readings} metric={metric} />
+              ))}
+            </div>
+
+            {forecastChartData && (
+              <article className="chart-card">
+                <div className="chart-head">
+                  <h2>Soil Forecast</h2>
+                  <p className="value-pill">
+                    {aiForecast ? `${aiForecast.horizon} steps` : '--'}
+                  </p>
+                </div>
+
+                <div className="chart-wrap">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={forecastChartData} margin={{ top: 10, right: 0, left: 10, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                      <XAxis
+                        dataKey="createdAt"
+                        tickFormatter={(value: string) =>
+                          new Date(value).toLocaleString([], {
+                            month: '2-digit',
+                            day: '2-digit',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        }
+                        minTickGap={24}
+                      />
+                      <YAxis width={48} domain={[0, 100]} />
+                      <Tooltip
+                        formatter={(value: number | string) => {
+                          const numeric = typeof value === 'number' ? value : Number(value)
+                          if (Number.isNaN(numeric)) {
+                            return '--'
+                          }
+
+                          return `${numeric.toFixed(2)}%`
+                        }}
+                        labelFormatter={(value: string) => new Date(value).toLocaleString()}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="soilPercent"
+                        stroke="#10b981"
+                        strokeWidth={2.5}
+                        dot={false}
+                        activeDot={{ r: 4 }}
+                        connectNulls
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="soilPercentPred"
+                        stroke="#f59e0b"
+                        strokeWidth={2.5}
+                        strokeDasharray="6 4"
+                        dot={false}
+                        activeDot={{ r: 4 }}
+                        connectNulls
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </article>
+            )}
+          </>
         )}
 
         {!loading && !error && readings.length === 0 && (
